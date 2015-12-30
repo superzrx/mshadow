@@ -8,8 +8,12 @@
 #ifndef MSHADOW_BASE_H_
 #define MSHADOW_BASE_H_
 #ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _CRT_SECURE_NO_DEPRECATE
 #define _CRT_SECURE_NO_DEPRECATE
+#endif
 #define NOMINMAX
 #endif
 #include <cmath>
@@ -17,6 +21,8 @@
 #include <cfloat>
 #include <climits>
 #include <algorithm>
+#include <sstream>
+#include <string>
 // macro defintiions
 /*!
  * \brief if this macro is define to be 1,
@@ -63,6 +69,7 @@
 #ifndef MSHADOW_USE_MKL
   #define MSHADOW_USE_MKL   1
 #endif
+
 /*!
  * \brief use CUDA support, must ensure that the cuda include path is correct,
  * or directly compile using nvcc
@@ -124,10 +131,8 @@ extern "C" {
   #include <curand.h>
 #endif
 
-#if MSHADOW_USE_CUDNN
-  #ifdef __CUDACC__
-    #include <cudnn.h>
-  #endif
+#if MSHADOW_USE_CUDNN == 1
+  #include <cudnn.h>
 #endif
 
 #if MSHADOW_USE_NVML
@@ -168,6 +173,44 @@ extern "C" {
 #ifndef MSHADOW_DEFAULT_DTYPE
 #define MSHADOW_DEFAULT_DTYPE = default_real_t
 #endif
+
+/*!
+ * \brief DMLC marco for logging
+ */
+#ifndef MSHADOW_USE_GLOG
+#define MSHADOW_USE_GLOG DMLC_USE_GLOG
+#endif  // MSHADOW_USE_GLOG
+
+/*!
+ * \brief Protected cuda call in mshadow
+ * \param func Expression to call.
+ * It checks for CUDA errors after invocation of the expression.
+ */
+#define MSHADOW_CUDA_CALL(func)                                    \
+  {                                                                \
+    cudaError_t e = (func);                                        \
+    if (e == cudaErrorCudartUnloading) {                           \
+      throw dmlc::Error(cudaGetErrorString(e));                    \
+    }                                                              \
+    CHECK(e == cudaSuccess)                                        \
+        << "CUDA: " << cudaGetErrorString(e);                      \
+  }
+
+/*!
+ * \brief Run function and catch error, log unknown error.
+ * \param func Expression to call.
+ */
+#define MSHADOW_CATCH_ERROR(func)                                     \
+  {                                                                   \
+    try {                                                             \
+      (func);                                                         \
+    } catch (const dmlc::Error &e) {                                    \
+      std::string what = e.what();                                      \
+      if (what.find("driver shutting down") == std::string::npos) {     \
+        LOG(ERROR) << "Ignore CUDA Error " << what;                     \
+      }                                                                 \
+    }                                                                   \
+  }
 
 /*! \brief namespace for mshadow */
 namespace mshadow {
@@ -372,6 +415,30 @@ struct maximum {
   template<typename DType>
   MSHADOW_XINLINE static void SetInitValue(DType &initv) { // NOLINT(*)
     initv = limits::MinValue<DType>();
+  }
+};
+/*! \brief minimum reducer */
+struct minimum {
+  /*! \brief do reduction into dst */
+  template<typename DType>
+  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src) { // NOLINT(*)
+    using namespace std;
+    dst = min(dst, src);
+  }
+  /*!
+   * \brief calculate gradient of redres with respect to redsrc,
+   * redres: reduced result, redsrc: one of reduction element
+   */
+  template<typename DType>
+  MSHADOW_XINLINE static DType PartialGrad(DType redres, DType redsrc) {
+    return redres == redsrc ? 1: 0;
+  }
+  /*!
+   *\brief set the initial value during reduction
+   */
+  template<typename DType>
+  MSHADOW_XINLINE static void SetInitValue(DType &initv) { // NOLINT(*)
+    initv = -limits::MinValue<DType>();
   }
 };
 }  // namespace red

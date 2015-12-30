@@ -19,7 +19,7 @@ else
 endif
 ifneq ($(USE_CUDA_PATH), NONE)
 	MSHADOW_CFLAGS += -I$(USE_CUDA_PATH)/include
-	MSHADOW_LDFLAGS += -L$(USE_CUDA_PATH)/lib64
+	MSHADOW_LDFLAGS += -L$(USE_CUDA_PATH)/lib64 -L$(USE_CUDA_PATH)/lib
 endif
 
 ifeq ($(USE_BLAS), mkl)
@@ -45,8 +45,11 @@ else
 	MSHADOW_LDFLAGS += -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5
 endif
 else
+ifneq ($(USE_BLAS), NONE)
 	MSHADOW_CFLAGS += -DMSHADOW_USE_CBLAS=1 -DMSHADOW_USE_MKL=0
 endif
+endif
+
 ifeq ($(USE_BLAS), openblas)
 	MSHADOW_LDFLAGS += -lopenblas
 else ifeq ($(USE_BLAS), atlas)

@@ -9,7 +9,8 @@
 #include <cstring>
 #include "./base.h"
 #include "./tensor.h"
-#include "./sse-inl.h"
+#include "./packet-inl.h"
+#include "./dot_engine-inl.h"
 
 namespace mshadow {
 template<>
@@ -32,6 +33,17 @@ inline void DeleteStream<cpu>(Stream<cpu> *stream) {
   delete stream;
 }
 
+template<int ndim>
+inline std::ostream &operator<<(std::ostream &os, const Shape<ndim> &shape) { // NOLINT(*)
+  os << "(";
+  for (int i = 0; i < ndim; ++i) {
+    if (i != 0) os << ",";
+    os << shape[i];
+  }
+  os << ")";
+  return os;
+}
+
 template<typename xpu>
 inline void *AllocHost_(size_t size);
 template<typename xpu>
@@ -41,37 +53,37 @@ inline void FreeHost_(void * dptr);
 template<>
 inline void *AllocHost_<gpu>(size_t size) {
   void *dptr;
-  utils::Check(cudaMallocHost(&dptr, size,
-                 cudaHostAllocPortable) == cudaSuccess,
-               "AllocHost");
+  MSHADOW_CUDA_CALL(cudaMallocHost(&dptr, size, cudaHostAllocPortable));
   return dptr;
 }
 template<>
 inline void FreeHost_<gpu>(void *dptr) {
-  cudaFreeHost(dptr);
+  MSHADOW_CUDA_CALL(cudaFreeHost(dptr));
 }
 #endif
 
 template<>
 inline void *AllocHost_<cpu>(size_t size) {
   size_t pitch;
-  return sse2::AlignedMallocPitch(&pitch, size, 1);
+  return packet::AlignedMallocPitch(&pitch, size, 1);
 }
 template<>
 inline void FreeHost_<cpu>(void *dptr) {
-  sse2::AlignedFree(dptr);
+  packet::AlignedFree(dptr);
 }
 
 template<typename xpu, int dim, typename DType>
 inline void AllocHost(Tensor<cpu, dim, DType> *obj) {
   obj->stride_ = obj->size(dim - 1);
-  utils::Assert(obj->CheckContiguous(), "AllocHost");
+  CHECK_EQ(obj->CheckContiguous(), true) << "AllocHost";
   void *dptr = AllocHost_<xpu>(obj->MSize() * sizeof(DType));
   obj->dptr_ = reinterpret_cast<DType*>(dptr);
 }
 template<typename xpu, int dim, typename DType>
 inline void FreeHost(Tensor<cpu, dim, DType> *obj) {
-  utils::Assert(obj->dptr_ != NULL, "FreeHost:: double free");
+  if (obj->dptr_ == NULL) {
+    LOG(FATAL) << "FreeHost:: double free";
+  }
   FreeHost_<xpu>(obj->dptr_);
   obj->dptr_ = NULL;
 }
@@ -81,12 +93,12 @@ inline void AllocSpace(Tensor<cpu, dim, DType> *obj, bool pad) {
   size_t pitch;
   void *dptr;
   if (pad) {
-    dptr = sse2::AlignedMallocPitch
+    dptr = packet::AlignedMallocPitch
         (&pitch, obj->size(dim - 1) * sizeof(DType), obj->shape_.FlatTo2D()[0]);
     obj->stride_ = static_cast<index_t>(pitch / sizeof(DType));
   } else {
     obj->stride_ = obj->size(dim - 1);
-    dptr = sse2::AlignedMallocPitch
+    dptr = packet::AlignedMallocPitch
         (&pitch, obj->shape_.Size() * sizeof(DType), 1);
   }
   obj->dptr_ = reinterpret_cast<DType*>(dptr);
@@ -102,18 +114,23 @@ NewTensor(const Shape<dim> &shape, DType initv, bool pad, Stream<Device> *stream
 }
 template<int dim, typename DType>
 inline void FreeSpace(Tensor<cpu, dim, DType> *obj) {
-  sse2::AlignedFree(obj->dptr_);
+  packet::AlignedFree(obj->dptr_);
   obj->dptr_ = NULL;
 }
 template<int dim, typename DType>
 inline void Copy(Tensor<cpu, dim, DType> _dst,
                  const Tensor<cpu, dim, DType> &_src,
                  Stream<cpu> *stream) {
-  utils::Check(_dst.shape_ == _src.shape_, "Copy:shape mismatch");
-  Tensor<cpu, 2, DType> dst = _dst.FlatTo2D();
-  Tensor<cpu, 2, DType> src = _src.FlatTo2D();
-  for (index_t y = 0; y < dst.size(0); ++y) {
-    memcpy(dst[y].dptr_, src[y].dptr_, sizeof(DType) * dst.size(1));
+  CHECK_EQ(_dst.shape_, _src.shape_)
+      << "Copy:shape mismatch:" << _dst.shape_ << " vs " << _src.shape_;
+  if (_dst.CheckContiguous() && _src.CheckContiguous()) {
+    memcpy(_dst.dptr_, _src.dptr_, sizeof(DType) * _dst.shape_.Size());
+  } else {
+    Tensor<cpu, 2, DType> dst = _dst.FlatTo2D();
+    Tensor<cpu, 2, DType> src = _src.FlatTo2D();
+    for (index_t y = 0; y < dst.size(0); ++y) {
+      memcpy(dst[y].dptr_, src[y].dptr_, sizeof(DType) * dst.size(1));
+    }
   }
 }
 
@@ -141,21 +158,21 @@ struct MapExpCPUEngine {
   }
 };
 
-#if MSHADOW_USE_SSE
 template<typename SV, int dim, typename DType, typename E, int etype>
 struct MapExpCPUEngine<true, SV, Tensor<cpu, dim, DType>,
                        dim, DType, E, etype> {
   inline static void Map(Tensor<cpu, dim, DType> *dst,
                          const expr::Exp<E, DType, etype> &exp) {
-    if (expr::SSEAlignCheck<dim, E>::Check(exp.self()) &&
-        expr::SSEAlignCheck<dim, Tensor<cpu, dim, DType> >::Check(*dst)) {
-      expr::MapSSEPlan<SV>(dst->self(), MakeSSEPlan(exp.self()));
+    if (expr::PacketAlignCheck<dim, E, MSHADOW_DEFAULT_PACKET>::Check(exp.self()) &&
+        expr::PacketAlignCheck<dim, Tensor<cpu, dim, DType>, MSHADOW_DEFAULT_PACKET>::Check(*dst)) {
+      expr::MapPacketPlan<SV>(dst->self(),
+                              expr::MakePacketPlan<MSHADOW_DEFAULT_PACKET>(exp.self()));
     } else {
       MapPlan<SV>(dst, MakePlan(exp.self()));
     }
   }
 };
-#endif
+
 
 template<typename Saver, typename R, int dim,
          typename DType, typename E, int etype>
@@ -165,14 +182,11 @@ inline void MapExp(TRValue<R, cpu, dim, DType> *dst,
       ::Error_All_Tensor_in_Exp_Must_Have_Same_Type();
   Shape<dim> eshape = expr::ShapeCheck<dim, E>::Check(exp.self());
   Shape<dim> dshape = expr::ShapeCheck<dim, R>::Check(dst->self());
-  utils::Check(eshape[0] == 0 || eshape == dshape,
-               "Assignment: Shape of Tensors are not consistent with target");
-#if MSHADOW_USE_SSE
-  MapExpCPUEngine<expr::SSECheck<E>::kPass, Saver, R, dim, DType, E, etype>
-      ::Map(dst->ptrself(), exp);
-#else
-  MapExpCPUEngine<false, Saver, R, dim, DType, E, etype>::Map(dst, exp);
-#endif
+  CHECK(eshape[0] == 0 || eshape == dshape)
+      << "Assignment: Shape of Tensors are not consistent with target";
+  MapExpCPUEngine<expr::PacketCheck<E, MSHADOW_DEFAULT_PACKET>::kPass,
+                  Saver, R, dim, DType, E, etype>
+  ::Map(dst->ptrself(), exp);
 }
 
 template<typename Saver, typename Reducer,
@@ -185,9 +199,8 @@ inline void MapReduceKeepLowest(TRValue<R, cpu, 1, DType> *dst,
   Shape<2> eshape = expr::ShapeCheck<expr::ExpInfo<E>::kDim, E>
       ::Check(exp.self()).FlatTo2D();
   Shape<1> dshape = expr::ShapeCheck<1, R>::Check(dst->self());
-  utils::Check(eshape[1] == dshape[0],
-               "MapReduceKeepLowest::reduction dimension do not match");
-  utils::Check(eshape[0] != 0, "can not reduce over empty tensor");
+  CHECK_EQ(eshape[1], dshape[0]) << "MapReduceKeepLowest::reduction dimension do not match";
+  CHECK_NE(eshape[0], 0) << "can not reduce over empty tensor";
   // execution
   expr::Plan<R, DType> dplan = MakePlan(dst->self());
   expr::Plan<E, DType> splan = MakePlan(exp.self());
@@ -211,8 +224,8 @@ inline void MapReduceKeepHighDim(TRValue<R, cpu, 1, DType> *dst,
   EShape eshape = expr::ShapeCheck<expr::ExpInfo<E>::kDim, E>
       ::Check(exp.self());
   Shape<1> dshape = expr::ShapeCheck<1, R>::Check(dst->self());
-  utils::Check(eshape[dimkeep] == dshape[0],
-               "MapReduceKeepHighDim::reduction dimension do not match");
+  CHECK_EQ(eshape[dimkeep], dshape[0])
+    << "MapReduceKeepHighDim::reduction dimension do not match";
   // use equvalent form
   Shape<4> pshape = Shape4(eshape.ProdShape(0, dimkeep),
                            eshape[dimkeep],
@@ -253,24 +266,109 @@ inline void Softmax(Tensor<cpu, 1, DType> dst,
     dst[x] /= sum;
   }
 }
+
+template<typename DType>
+inline void SoftmaxGrad(Tensor<cpu, 2, DType> dst,
+                        const Tensor<cpu, 2, DType> &src,
+                        const Tensor<cpu, 1, DType> &label) {
+  for (index_t y = 0; y < dst.size(0); ++y) {
+    const index_t k = static_cast<int>(label[y]);
+    for (index_t x = 0; x < dst.size(1); ++x) {
+      if (x == k) {
+        dst[y][k] = src[y][k] - 1.0f;
+      } else {
+        dst[y][x] = src[y][x];
+      }
+    }
+  }
+}
+
+template<typename DType>
+inline void SoftmaxGrad(Tensor<cpu, 3, DType> dst,
+                        const Tensor<cpu, 3, DType> &src,
+                        const Tensor<cpu, 2, DType> &label) {
+  for (index_t n = 0; n < dst.size(2); ++n) {
+    for (index_t y = 0; y < dst.size(0); ++y) {
+      const index_t k = static_cast<int>(label[y][n]);
+      for (index_t x = 0; x < dst.size(1); ++x) {
+        if (x == k) {
+          dst[y][k][n] = src[y][k][n] - 1.0f;
+        } else {
+          dst[y][x][n] = src[y][x][n];
+        }
+      }
+    }
+  }
+}
+
+template<typename DType>
+inline void SoftmaxGrad(Tensor<cpu, 3, DType> dst,
+                        const Tensor<cpu, 3, DType> &src,
+                        const Tensor<cpu, 2, DType> &label,
+                        const DType &ignore_label) {
+  for (index_t n = 0; n < dst.size(2); ++n) {
+    for (index_t y = 0; y < dst.size(0); ++y) {
+      const index_t k = static_cast<int>(label[y][n]);
+      if (k == static_cast<int>(ignore_label)) {
+        for (index_t x = 0; x < dst.size(1); ++x) {
+          dst[y][x][n] = 0.0f;
+        }
+      } else {
+        for (index_t x = 0; x < dst.size(1); ++x) {
+          if (x == k) {
+            dst[y][k][n] = src[y][k][n] - 1.0f;
+          } else {
+            dst[y][x][n] = src[y][x][n];
+          }
+        }
+      }
+    }
+  }
+}
+
 template<typename DType>
 inline void Softmax(Tensor<cpu, 2, DType> dst,
                     const Tensor<cpu, 2, DType> &energy) {
-  utils::Check(dst.shape_ == energy.shape_, "Softmax: shape mismatch");
+  CHECK_EQ(dst.shape_, energy.shape_) << "Softmax: shape mismatch";
   for (index_t y = 0; y < dst.size(0); ++y) {
     Softmax(dst[y], energy[y]);
   }
 }
 
 template<typename DType>
-inline DType VDot(const Tensor<cpu, 1, DType> &lhs,
-                  const Tensor<cpu, 1, DType> &rhs) {
-  utils::Check(lhs.shape_ == rhs.shape_, "VDot: shape mismatch");
-  DType sum = static_cast<DType>(0);
-  for (index_t x = 0; x < lhs.size(0); ++x) {
-    sum += lhs[x] * rhs[x];
+inline void Softmax(Tensor<cpu, 3, DType> dst,
+                    const Tensor<cpu, 3, DType> &energy) {
+  CHECK_EQ(dst.shape_, energy.shape_) << "Softmax: shape mismatch";
+  for (index_t y = 0; y < dst.size(0); ++y) {
+    for (index_t n = 0; n < dst.size(2); ++n) {
+      DType mmax = energy[y][0][n];
+      for (index_t x = 1; x < dst.size(1); ++x) {
+        if (mmax < energy[y][x][n]) mmax = energy[y][x][n];
+      }
+      DType sum = 0.0f;
+      for (index_t x = 0; x < dst.size(1); ++x) {
+        dst[y][x][n] = std::exp(energy[y][x][n] - mmax);
+        sum += dst[y][x][n];
+      }
+      for (index_t x = 0; x < dst.size(1); ++x) {
+        dst[y][x][n] /= sum;
+      }
+    }
   }
-  return sum;
+}
+
+// blas related
+template<typename Device, typename DType>
+inline void VectorDot(Tensor<Device, 1, DType> dst,
+                      const Tensor<Device, 1, DType> &lhs,
+                      const Tensor<Device, 1, DType> &rhs) {
+  CHECK_EQ(lhs.size(0), rhs.size(0))
+      << "VectorDot: Shape mismatch";
+  CHECK_EQ(dst.size(0), 1)
+      << "VectorDot: expect dst to be scalar";
+  expr::BLASEngine<Device>::SetStream(lhs.stream_);
+  mshadow::expr::BLASEngine<Device>::dot(
+      lhs.stream_, lhs.size(0), lhs.dptr_, 1, rhs.dptr_, 1, dst.dptr_);
 }
 }  // namespace mshadow
 #endif  // MSHADOW_TENSOR_CPU_INL_H_

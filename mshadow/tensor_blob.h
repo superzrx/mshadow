@@ -10,8 +10,10 @@
 #define MSHADOW_TENSOR_BLOB_H_
 #include <vector>
 #include <algorithm>
+#include <iostream>
+#include <cctype>
 #include "./tensor.h"
-
+#include "./logging.h"
 namespace mshadow {
 /*!
  * \brief dynamic shape class that can hold shape
@@ -68,6 +70,17 @@ struct TShape {
     }
     // remove data heap space from s
     s.data_heap_ = NULL;
+  }
+  /*!
+   * \brief move constructor from Shape
+   * \param s the source shape
+   */
+  template<int dim>
+  TShape(Shape<dim> &&s)  // NOLINT(*)
+      : ndim_(0),
+        num_heap_allocated_(0),
+        data_heap_(NULL) {
+    this->CopyFrom(s.shape_, s.shape_ + dim);
   }
 #endif
   /*! \brief destructor */
@@ -182,8 +195,7 @@ struct TShape {
    */
   template<int dim>
   inline Shape<dim> get(void) const {
-    utils::Check(dim == ndim_,
-                 "dimension do not match target dimension");
+    CHECK_EQ(dim, ndim_) << "dimension do not match target dimension " << dim << " vs " << ndim_;
     const index_t *d = this->data();
     Shape<dim> s;
     for (int i = 0; i < dim; ++i) {
@@ -238,6 +250,33 @@ struct TShape {
   inline bool operator!=(const Shape<dim> &s) const {
     return !(*this == s);
   }
+  /*!
+   * \brief save the content into binary stream
+   * \param strm the output stream
+   * \tparam TStream any stream type that have write
+   */
+  template<typename TStream>
+  inline void Save(TStream *strm) const {
+    strm->Write(&ndim_, sizeof(ndim_));
+    strm->Write(data(), sizeof(index_t) * ndim_);
+  }
+  /*!
+   * \brief load the content from binary stream
+   * \param strm the output stream
+   * \tparam TStream any stream type that have write
+   * \return whether the load is successful
+   */
+  template<typename TStream>
+  inline bool Load(TStream *strm) {
+    if (strm->Read(&ndim_, sizeof(ndim_)) != sizeof(ndim_)) return false;
+    this->SetDim(ndim_);
+    size_t nread = sizeof(index_t) * ndim_;
+    if (strm->Read(data(), nread) != nread) return false;
+    return true;
+  }
+
+  friend std::ostream &operator<<(std::ostream &os, const TShape &shape);
+  friend std::istream &operator>>(std::istream &is, TShape &shape);
 
  private:
   // the shape will be stored in data_stack_
@@ -268,6 +307,71 @@ struct TShape {
     ndim_ = dim;
   }
 };
+
+/*!
+ * \brief allow string printing of the shape
+ * \param os the output stream
+ * \param shape the shape
+ * \return the ostream
+ */
+inline std::ostream &operator<<(std::ostream &os, const TShape &shape) {
+  os << '(';
+  for (index_t i = 0; i < shape.ndim(); ++i) {
+    if (i != 0) os << ", ";
+    os << shape[i];
+  }
+  // python style tuple
+  if (shape.ndim() == 1) os << ',';
+  os << ')';
+  return os;
+}
+
+/*!
+ * \brief read shape from the istream
+ * \param is the input stream
+ * \param shape the shape
+ * \return the istream
+ */
+inline std::istream &operator>>(std::istream &is, TShape &shape) {
+  // get (
+  while (true) {
+    char ch = is.get();
+    if (ch == '(') break;
+    if (!isspace(ch)) {
+      is.setstate(std::ios::failbit);
+      return is;
+    }
+  }
+  index_t idx;
+  std::vector<index_t> tmp;
+  while (is >> idx) {
+    tmp.push_back(idx);
+    char ch;
+    do {
+      ch = is.get();
+    } while (isspace(ch));
+    if (ch == ',') {
+      while (true) {
+        ch = is.peek();
+        if (isspace(ch)) {
+          is.get(); continue;
+        }
+        if (ch == ')') {
+          is.get(); break;
+        }
+        break;
+      }
+      if (ch == ')') break;
+    } else if (ch == ')') {
+      break;
+    } else {
+      is.setstate(std::ios::failbit);
+      return is;
+    }
+  }
+  shape.CopyFrom(tmp.begin(), tmp.end());
+  return is;
+}
 
 /*! \brief data type flag */
 template<typename DType>
@@ -369,8 +473,8 @@ class TBlob {
    */
   template<typename Device, typename DType>
   inline Tensor<Device, 2, DType> FlatTo2D(Stream<Device> *stream = NULL) const {
-    utils::Check(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_,
-                 "TBlob.get: device type do not match specified type");
+    CHECK(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_)
+      << "TBlob.get: device type do not match specified type";
     return Tensor<Device, 2, DType>(static_cast<DType*>(dptr_),
                                     shape_.FlatTo2D(), stride_, stream);
   }
@@ -386,6 +490,10 @@ class TBlob {
   inline index_t size(index_t idx) const {
     return shape_[idx];
   }
+  /*! \brief total number of elements in the tensor */
+  inline index_t Size(void) const {
+    return shape_.Size();
+  }
   /*!
    * \brief fetch the tensor, with respect to specific dimension
    * if dim do not match the stored dimension, an error will be issued
@@ -397,15 +505,15 @@ class TBlob {
    */
   template<typename Device, int dim, typename DType>
   inline Tensor<Device, dim, DType> get(Stream<Device> *stream = NULL) const {
-    utils::Check(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_,
-                 "TBlob.get: device type do not match specified type");
+    CHECK(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_)
+      << "TBlob.get: device type do not match specified type";
     return Tensor<Device, dim, DType>(static_cast<DType*>(dptr_),
                                        shape_.get<dim>(),
                                        stride_, stream);
   }
   /*!
    * \brief fetch a tensor in given shape
-   * if size do not match the stored dimension, an error will be issued
+   *  If size do not match the stored size, an error will be issued
    * \return the tensor requested
    * \param shape the shape required
    * \param stream the possible stream target tensor should reside on
@@ -414,15 +522,15 @@ class TBlob {
    * \tparam DType the type of elements in the tensor
    */
   template<typename Device, int dim, typename DType>
-  inline Tensor<Device, dim, DType> get_with_shape(const TShape &shape,
+  inline Tensor<Device, dim, DType> get_with_shape(const Shape<dim> &shape,
                                                    Stream<Device> *stream = NULL) const {
-    utils::Check(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_,
-                 "TBlob.get_with_shape: device type do not match specified type");
-    utils::Check(this->CheckContiguous(), "TBlob.get_reshape: must be contiguous");
-    utils::Check(this->shape_.Size() == shape.Size(),
-                 "TBlob.get_with_shape: new and old shape do not match total elements");
+    CHECK(Device::kDevMask == dev_mask_ && DataType<DType>::kFlag == type_flag_)
+      << "TBlob.get_with_shape: device type do not match specified type";
+    CHECK_EQ(this->CheckContiguous(), true) << "TBlob.get_reshape: must be contiguous";
+    CHECK_EQ(this->shape_.Size(), shape.Size())
+      << "TBlob.get_with_shape: new and old shape do not match total elements";
     return Tensor<Device, dim, DType>(static_cast<DType*>(dptr_),
-                                      shape.get<dim>(),
+                                      shape,
                                       shape[dim - 1],
                                       stream);
   }

@@ -11,6 +11,8 @@
  */
 #ifndef MSHADOW_TENSOR_H_
 #define MSHADOW_TENSOR_H_
+#include <string>
+#include <iostream>
 #include "./base.h"
 #include "./expression.h"
 
@@ -29,6 +31,18 @@ struct gpu {
   /*! \brief device flag number, identifies this device */
   static const int kDevMask = 1 << 1;
 };
+template<int ndim>
+struct Shape;
+
+/*!
+ * \brief allow string printing of the shape
+ * \param os the output stream
+ * \param shape the shape
+ * \return the ostream
+ */
+template<int ndim>
+inline std::ostream &operator<<(std::ostream &os, const Shape<ndim> &shape); // NOLINT(*)
+
 /*!
  * \brief shape of a tensor
  *       IMPORTANT NOTE: this shape is different from numpy.shape
@@ -152,6 +166,10 @@ v   * \return subshape
     }
     return s;
   }
+  //! \cond Doxygen_Suppress
+  template<int dim>
+  friend std::ostream &operator<<(std::ostream &os, const Shape<dim> &shape); // NOLINT(*)
+  //! \endcond
 };  // Shape
 //------------------------------------------------
 // useful construction functions to generate shape
@@ -199,6 +217,21 @@ MSHADOW_XINLINE Shape<4> Shape4(index_t s0, index_t s1,
                                 index_t s2, index_t s3) {
   Shape<4> s;
   s[0] = s0; s[1] = s1; s[2] = s2; s[3] = s3;
+  return s;
+}
+/*!
+* \brief construct a five dimension shape, stride will equal s0
+* \param s0 size of dimension 0
+* \param s1 size of dimension 1
+* \param s2 size of dimension 2
+* \param s3 size of dimension 3
+* \param s4 size of dimension 4
+* \return the shape construction
+*/
+MSHADOW_XINLINE Shape<5> Shape5(index_t s0, index_t s1, index_t s2,
+                                index_t s3, index_t s4) {
+  Shape<5> s;
+  s[0] = s0; s[1] = s1; s[2] = s2; s[3] = s3; s[4] = s4;
   return s;
 }
 /*!
@@ -280,6 +313,10 @@ struct Tensor: public TRValue<Tensor<Device, dimension, DType>,
   /*! \brief constructor from data pointer and shape, without stride */
   MSHADOW_XINLINE Tensor(DType *dptr, const Shape<dimension> &shape)
       : dptr_(dptr), shape_(shape), stride_(shape[kSubdim]), stream_(NULL) {}
+  /*! \brief constructor from data pointer and shape, without stride */
+  MSHADOW_XINLINE Tensor(DType *dptr, const Shape<dimension> &shape,
+                         Stream<Device> *stream)
+    : dptr_(dptr), shape_(shape), stride_(shape[kSubdim]), stream_(stream) {}
   /*! \brief constructor from data pointer and shape  */
   MSHADOW_XINLINE Tensor(DType *dptr,
                          const Shape<dimension> &shape,
@@ -610,6 +647,27 @@ inline void Softmax(Tensor<cpu, 2, DType> dst, const Tensor<cpu, 2, DType> &ener
  */
 template<typename DType>
 inline void Softmax(Tensor<gpu, 2, DType> dst, const Tensor<gpu, 2, DType> &energy);
+
+/*!
+ * \brief CPU/GPU: softmax gradient
+ * \param dst destination
+ * \param src source output
+ * \param label label info
+ */
+template<typename DType>
+inline void SoftmaxGrad(Tensor<cpu, 2, DType> dst,
+                        const Tensor<cpu, 2, DType> &src,
+                        const Tensor<cpu, 1, DType> &label);
+/*!
+ * \brief CPU/GPU: softmax gradient
+ * \param dst destination
+ * \param src source output
+ * \param label label info
+ */
+template<typename DType>
+inline void SoftmaxGrad(Tensor<gpu, 2, DType> dst,
+                        const Tensor<gpu, 2, DType> &src,
+                        const Tensor<gpu, 1, DType> &label);
 // function declarations to support expression, no need to understand them
 // these functions do not need to be directly used
 /*!
@@ -718,11 +776,22 @@ template<typename Saver, typename Reducer, int dimkeep,
 inline void MapReduceKeepHighDim(TRValue<R, gpu, 1, DType> *dst,
                                  const expr::Exp<E, DType, etype> &exp,
                                  DType scale = 1);
+
+/*!
+ * \brief CPU/GPU: 1 dimension vector dot
+ * \param dst Length 1 vector, used to hold the result.
+ * \param lhs Left operand vector
+ * \param rhs right operand vector
+ */
+template<typename Device, typename DType>
+inline void VectorDot(Tensor<Device, 1, DType> dst,
+                      const Tensor<Device, 1, DType> &lhs,
+                      const Tensor<Device, 1, DType> &rhs);
 }  // namespace mshadow
 // include headers
 #include "./stream_gpu-inl.h"
-#include "./expr_engine-inl.h"
 #include "./extension.h"
+#include "./expr_engine-inl.h"
 #include "./tensor_cpu-inl.h"
 #include "./tensor_gpu-inl.h"
 #include "./io.h"

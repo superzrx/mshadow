@@ -8,7 +8,7 @@
 #define MSHADOW_STREAM_GPU_INL_H_
 #include "./base.h"
 #include "./tensor.h"
-#include "./utils.h"
+#include "./logging.h"
 
 namespace mshadow {
 #if MSHADOW_USE_CUDA == 1
@@ -25,14 +25,15 @@ struct Stream<gpu> {
   cudaStream_t stream_;
   /*! \brief cublas handle */
   cublasHandle_t blas_handle_;
+  /*! \brief cudnn handle */
+  #if MSHADOW_USE_CUDNN == 1
+  cudnnHandle_t dnn_handle_;
+  #endif
   /*! \brief cublas handle ownership */
   HandleState blas_handle_ownership_;
   /*! \brief cudnn handle ownership */
   HandleState dnn_handle_ownership_;
-#if MSHADOW_USE_CUDNN == 1
-  /*! \brief cudnn handle */
-  cudnnHandle_t dnn_handle_;
-#endif
+
   Stream(void) : stream_(0),
                  blas_handle_ownership_(NoHandle),
                  dnn_handle_ownership_(NoHandle) {}
@@ -41,8 +42,7 @@ struct Stream<gpu> {
    *  with this stream to complete
    */
   inline void Wait(void) {
-    cudaError_t err = cudaStreamSynchronize(stream_);
-    utils::Check(err == cudaSuccess, cudaGetErrorString(err));
+    MSHADOW_CUDA_CALL(cudaStreamSynchronize(stream_));
   }
   /*!
    * \brief query whether the the stream is idle
@@ -52,7 +52,7 @@ struct Stream<gpu> {
     cudaError_t err = cudaStreamQuery(stream_);
     if (err == cudaSuccess) return true;
     if (err == cudaErrorNotReady) return false;
-    utils::Error(cudaGetErrorString(err));
+    LOG(FATAL) << cudaGetErrorString(err);
     return false;
   }
   /*!
@@ -62,7 +62,7 @@ struct Stream<gpu> {
   inline static cudaStream_t GetStream(Stream<gpu> *stream) {
     if (stream == NULL) {
 #if MSHADOW_FORCE_STREAM
-      utils::Error("Default GPU stream was used when MSHADOW_FORCE_STREAM was on");
+      LOG(FATAL) << "Default GPU stream was used when MSHADOW_FORCE_STREAM was on";
 #endif
       return 0;
     } else {
@@ -77,8 +77,8 @@ struct Stream<gpu> {
     if (stream == NULL) {
       return 0;
     } else {
-      utils::Check(stream->blas_handle_ownership_ != NoHandle,
-                   "No handle exist in source stream");
+      CHECK_NE(stream->blas_handle_ownership_, NoHandle)
+        << "No handle exist in source stream";
       return stream->blas_handle_;
     }
   }
@@ -87,7 +87,7 @@ struct Stream<gpu> {
     if (blas_handle_ownership_ == OwnHandle) {
       cublasStatus_t err = cublasDestroy(blas_handle_);
       blas_handle_ownership_ = NoHandle;
-      utils::Check(err == CUBLAS_STATUS_SUCCESS, "Destory cublas handle failed");
+      CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Destory cublas handle failed";
     }
   }
   /*! \brief Destory original blas handle and create a new one */
@@ -95,34 +95,37 @@ struct Stream<gpu> {
     this->DestoryBlasHandle();
     cublasStatus_t err = cublasCreate(&blas_handle_);
     blas_handle_ownership_ = OwnHandle;
-    utils::Check(err == CUBLAS_STATUS_SUCCESS, "Create cublas handle failed");
+    CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Create cublas handle failed";
   }
-#if MSHADOW_USE_CUDNN && defined(__CUDACC__)
+// #if MSHADOW_USE_CUDNN && defined(__CUDACC__)
+#if MSHADOW_USE_CUDNN == 1
   inline static cudnnHandle_t GetDnnHandle(Stream<gpu> *stream) {
     if (stream == NULL) {
       return 0;
     } else {
-      utils::Check(stream->dnn_handle_ownership_ != NoHandle,
-                   "No handle exist in source stream");
+      CHECK_NE(stream->dnn_handle_ownership_, NoHandle) << "No handle exist in source stream";
       return stream->dnn_handle_;
     }
   }
 #endif
   inline void DestroyDnnHandle() {
-#if MSHADOW_USE_CUDNN && defined(__CUDACC__)
+// #if MSHADOW_USE_CUDNN && defined(__CUDACC__)
+#if MSHADOW_USE_CUDNN == 1
     if (dnn_handle_ownership_ == OwnHandle) {
       cudnnStatus_t err = cudnnDestroy(dnn_handle_);
-      utils::Check(err == CUDNN_STATUS_SUCCESS,
-                   "Destroy cudnn handle failed");
+      CHECK_EQ(err, CUDNN_STATUS_SUCCESS) << cudnnGetErrorString(err);
     }
 #endif
   }
   inline void CreateDnnHandle() {
-#if MSHADOW_USE_CUDNN && defined(__CUDACC__)
+// #if MSHADOW_USE_CUDNN == 1 && defined(__CUDACC__)
+#if MSHADOW_USE_CUDNN == 1
     this->DestroyDnnHandle();
     cudnnStatus_t err = cudnnCreate(&dnn_handle_);
-    utils::Check(err == CUDNN_STATUS_SUCCESS,
-                 "Create cudnn handle failed");
+    CHECK_EQ(err, CUDNN_STATUS_SUCCESS) << cudnnGetErrorString(err);
+    err = cudnnSetStream(dnn_handle_, stream_);
+    CHECK_EQ(err, CUDNN_STATUS_SUCCESS) << cudnnGetErrorString(err);
+    this->dnn_handle_ownership_ = OwnHandle;
 #endif
   }
 };
@@ -130,20 +133,18 @@ template<>
 inline Stream<gpu> *NewStream<gpu>(bool create_blas_handle,
                                    bool create_dnn_handle) {
   Stream<gpu> *st = new Stream<gpu>();
-  cudaError_t err = cudaStreamCreate(&st->stream_);
+  MSHADOW_CUDA_CALL(cudaStreamCreate(&st->stream_));
   if (create_blas_handle) {
     st->CreateBlasHandle();
   }
   if (create_dnn_handle) {
     st->CreateDnnHandle();
   }
-  utils::Check(err == cudaSuccess, cudaGetErrorString(err));
   return st;
 }
 template<>
 inline void DeleteStream<gpu>(Stream<gpu> *stream) {
-  cudaError_t err = cudaStreamDestroy(stream->stream_);
-  utils::Check(err == cudaSuccess, cudaGetErrorString(err));
+  MSHADOW_CUDA_CALL(cudaStreamDestroy(stream->stream_));
   stream->DestoryBlasHandle();
   stream->DestroyDnnHandle();
   delete stream;
